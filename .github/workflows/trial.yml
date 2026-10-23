@@ -90,7 +90,8 @@ jobs:
           for ip in $ips; do sudo iptables -A trialguard -d "$ip" -j ACCEPT; done
           # deepseek is CloudFront (rotating) -> also allow AWS CloudFront ranges to avoid mid-run breakage
           if [ "$MODEL" = deepseek ]; then
-            for c in $(curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | jq -r '.prefixes[]|select(.service=="CLOUDFRONT")|.ip_prefix'); do sudo iptables -A trialguard -d "$c" -j ACCEPT; done
+            n=0; for c in $(curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | jq -r '.prefixes[]|select(.service=="CLOUDFRONT")|.ip_prefix'); do sudo iptables -A trialguard -d "$c" -j ACCEPT; n=$((n+1)); done
+            echo "CloudFront CIDRs allowlisted: $n (0 => rotation will break the agent; need a fix)"
           fi
           sudo iptables -A trialguard -j REJECT --reject-with icmp-port-unreachable
           sudo iptables -I DOCKER-USER -j trialguard
@@ -117,18 +118,27 @@ jobs:
           unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_MODEL
           lim=$(awk '/^\[/{s=$0} s=="[agent]" && /^timeout_sec/{print int($3)}' "$TASK/task.toml"); lim=${lim:-7200}
           [ -n "$eff" ] && extra+=(--ak "reasoning_effort=$eff")
-          solved=0
-          for r in $(seq 1 "$RUNS"); do
-            jn="$ID-$MODEL-r$r"
+          # Count only CLEAN graded runs. An exception/empty run (UnknownApiError, timeout, no reward)
+          # is a harness/API defect -> retry, never count as a model fail (would manufacture fake breakers).
+          solved=0; counted=0; infra=0; INFRA_MAX=6; attempt=0; rewards=""
+          while [ "$counted" -lt "$RUNS" ] && [ "$infra" -le "$INFRA_MAX" ]; do
+            attempt=$((attempt+1)); jn="$ID-$MODEL-a$attempt"
             harbor run -p "$TASK" -a claude-code -m "$mid" -k 1 -o "/tmp/jobs" --job-name "$jn" \
               --ae API_TIMEOUT_MS=1200000 --ae "CWE_AGENT_LIMIT_SEC=$lim" \
               --ek keep_containers=true --ak "disallowed_tools=WebSearch,WebFetch" \
               "${extra[@]}" -y -q > "/tmp/$jn.log" 2>&1 || true
             rw=$(find "/tmp/jobs/$jn" -name reward.txt -exec cat {} \; 2>/dev/null | tail -1)
-            echo "RUN $ID $MODEL r$r reward=${rw:-NONE}"
-            if [ "$rw" = "1.0" ]; then solved=1; echo "SOLVED on r$r -> early-abort (not a breaker for $MODEL)"; break; fi
+            # infra/exception markers in harbor output, or a missing reward = not a counted run
+            if grep -qiE "UnknownApiError|AgentTimeoutError|EnvironmentStartTimeout|NonZeroAgentExitCode|ApiError|overloaded|Exceptions +. +[1-9]" "/tmp/$jn.log" || [ -z "$rw" ]; then
+              infra=$((infra+1)); echo "INFRA $ID $MODEL a$attempt (not counted): $(grep -oiE "UnknownApiError|AgentTimeoutError|EnvironmentStartTimeout|NonZeroAgentExitCode|ApiError|overloaded" "/tmp/$jn.log" | head -1)${rw:+ reward=$rw}"
+              sleep $((20*infra)); continue
+            fi
+            counted=$((counted+1)); rewards="$rewards $rw"
+            echo "RUN $ID $MODEL counted=$counted reward=$rw"
+            if [ "$rw" = "1.0" ]; then solved=1; echo "SOLVED -> early-abort (not a breaker for $MODEL)"; break; fi
           done
-          echo "SUMMARY $ID $MODEL solved=$solved runs=$r"
+          status=ok; [ "$counted" -lt "$RUNS" ] && [ "$solved" -eq 0 ] && status=TRIAL-INFEASIBLE-too-many-infra-errors
+          echo "SUMMARY $ID $MODEL solved=$solved counted=$counted infra=$infra rewards=[$rewards] status=$status"
       - name: Pack (encrypted) rewards + logs
         if: always()
         env:
