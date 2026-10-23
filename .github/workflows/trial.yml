@@ -126,6 +126,7 @@ jobs:
           while [ "$counted" -lt "$RUNS" ] && [ "$infra" -le "$INFRA_MAX" ]; do
             attempt=$((attempt+1)); jn="$ID-$MODEL-a$attempt"
             harbor run -p "$TASK" -a claude-code -m "$mid" -k 1 -o "/tmp/jobs" --job-name "$jn" \
+              --ae "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL" --ae "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" \
               --ae API_TIMEOUT_MS=1200000 --ae "CWE_AGENT_LIMIT_SEC=$lim" \
               --ek keep_containers=true --ak "disallowed_tools=WebSearch,WebFetch" \
               "${extra[@]}" -y -q > "/tmp/$jn.log" 2>&1 || true
@@ -150,6 +151,9 @@ jobs:
           mkdir -p /tmp/out
           cp /tmp/*.log /tmp/out/ 2>/dev/null || true
           find /tmp/jobs -path '*/verifier/*' \( -name 'reward.json' -o -name 'results.json' \) -exec cp --parents {} /tmp/out/ \; 2>/dev/null || true
+          find /tmp/jobs -name 'result.json' -exec cp --parents {} /tmp/out/ \; 2>/dev/null || true
+          # capture the agent's error detail for diagnosis (exception message/url/status), size-limited
+          find /tmp/jobs -maxdepth 4 \( -name '*.json' -o -name '*.log' -o -name '*.txt' \) ! -path '*/verifier/*' -size -512k -exec cp --parents {} /tmp/out/ \; 2>/dev/null || true
           grep -rhE "^(RUN|SUMMARY|self-check) " /tmp/*.log 2>/dev/null > /tmp/out/trial_summary.txt || true
           tar -czf /tmp/o.tgz -C /tmp out
           gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" --symmetric --cipher-algo AES256 -o "/tmp/$ID-$MODEL.tgz.gpg" /tmp/o.tgz
