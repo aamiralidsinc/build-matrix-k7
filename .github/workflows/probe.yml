@@ -1,7 +1,7 @@
 name: probe
-# Network-isolation probe: does the netguard sidecar build + run on an Actions runner, and what does
-# it allow/block? Reuses root/harness/netguard from the encrypted payload (no payload change). Proves
-# portability of the VM's isolation to Actions before any trial runs here. Read-only w.r.t. results.
+# Payload-free network-isolation probe. Answers: (1) does a container on an Actions runner have open
+# internet by default? (2) can we fully cut egress? (3) can we allow ONLY the model API (the policy
+# valid CWE-bench trials need)? Decides whether trials can run validly on Actions.
 on:
   workflow_dispatch: {}
 permissions:
@@ -9,43 +9,41 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Decrypt payload (for root/harness/netguard)
-        env:
-          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+      - name: 1) Baseline — default container egress (expect ALL reachable = open internet)
         run: |
-          mkdir -p /tmp/pl
-          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" -d payload.tar.gz.gpg | tar -xz -C /tmp/pl
-          pv=$(cat /tmp/pl/pv_path); echo "::add-mask::$pv"
-          test -f /tmp/pl/root/harness/netguard/Dockerfile && echo "netguard source present"
-      - name: Baseline — default container egress (expect open internet on Actions)
+          c(){ docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || echo FAIL; }
+          echo "example.com      -> $(c https://example.com)"
+          echo "github.com       -> $(c https://github.com)"
+          echo "api.deepseek.com -> $(c https://api.deepseek.com)"
+          echo "api.xiaomimimo   -> $(c https://api.xiaomimimo.com)"
+      - name: 2) Cut egress — docker --network none (expect ALL FAIL)
         run: |
-          echo "example.com  -> $(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com || echo FAIL)"
-          echo "github.com   -> $(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com || echo FAIL)"
-          echo "deepseek api -> $(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://api.deepseek.com || echo FAIL)"
-      - name: Build netguard
-        run: docker build -t cwe-netguard:1 /tmp/pl/root/harness/netguard
-      - name: Probe through netguard (block-repo mode, sample repo rails/rails)
+          c(){ docker run --rm --network none curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo FAIL; }
+          echo "example.com      -> $(c https://example.com)"
+          echo "api.deepseek.com -> $(c https://api.deepseek.com)"
+      - name: 3) Allow ONLY the model API (iptables allowlist on a user bridge)
         run: |
-          net=probe-$$;
-          # sidecar with egress filtering; main joins its netns, exactly like a trial's compose
-          docker run -d --name ng --cap-add NET_ADMIN --cap-add NET_RAW \
-            -e NETGUARD_BLOCK_REPOS=rails/rails -e NETGUARD_BLOCK_NAMES=rails \
-            -v ngcerts:/netguard-certs cwe-netguard:1
-          for i in $(seq 1 60); do docker exec ng test -f /tmp/netguard.ready 2>/dev/null && break; sleep 1; done
-          docker exec ng test -f /tmp/netguard.ready && echo "netguard: ready" || { echo "netguard: NOT ready"; docker logs ng | tail -20; }
-          probe() { docker run --rm --network container:ng -v ngcerts:/netguard-certs:ro \
-            -e CURL_CA_BUNDLE=/netguard-certs/bundle.pem curlimages/curl:8.11.1 \
-            -s -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null || echo FAIL; }
-          echo "via netguard | example.com         -> $(probe https://example.com)   (expect reachable: 200/3xx)"
-          echo "via netguard | api.deepseek.com     -> $(probe https://api.deepseek.com) (expect reachable)"
-          echo "via netguard | github rails/rails   -> $(probe https://github.com/rails/rails) (expect 403 BLOCKED)"
-          echo "via netguard | github other/repo    -> $(probe https://github.com/torvalds/linux) (expect reachable)"
-          echo "--- netguard decision log ---"; docker logs ng 2>&1 | grep -a netguard | tail -20
-          docker rm -f ng >/dev/null 2>&1 || true
+          set -x
+          net=trialnet
+          docker network create --driver bridge --subnet 172.31.9.0/24 "$net"
+          # resolve model-API IPs on the host, allow only those out of the bridge subnet; drop the rest
+          ips=$(for h in api.deepseek.com api.xiaomimimo.com; do getent ahostsv4 "$h" | awk '{print $1}' | sort -u; done)
+          echo "model API IPs: $ips"
+          sudo iptables -N trialguard 2>/dev/null || sudo iptables -F trialguard
+          for ip in $ips; do sudo iptables -A trialguard -d "$ip" -j ACCEPT; done
+          sudo iptables -A trialguard -d 172.31.9.0/24 -j ACCEPT      # intra-net (DNS to docker)
+          sudo iptables -A trialguard -p udp --dport 53 -j ACCEPT     # DNS
+          sudo iptables -A trialguard -j REJECT
+          sudo iptables -I DOCKER-USER -s 172.31.9.0/24 -j trialguard
+          c(){ docker run --rm --network "$net" curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || echo FAIL; }
+          set +x
+          echo "RESULT example.com      -> $(c https://example.com)     (want FAIL/blocked)"
+          echo "RESULT github.com       -> $(c https://github.com)      (want FAIL/blocked)"
+          echo "RESULT api.deepseek.com -> $(c https://api.deepseek.com) (want reachable)"
+          sudo iptables -D DOCKER-USER -s 172.31.9.0/24 -j trialguard 2>/dev/null || true
       - name: Verdict
         run: |
-          echo "READ: if 'via netguard' blocks rails/rails (403) but allows example/deepseek, the sidecar"
-          echo "works on Actions. For OFFLINE trials we then flip netguard to allowlist ONLY the model API."
+          echo "If step1=open, step2=all FAIL, step3 blocks example/github but allows deepseek,"
+          echo "then an iptables allowlist gives model-API-only egress on Actions -> valid trials here."
