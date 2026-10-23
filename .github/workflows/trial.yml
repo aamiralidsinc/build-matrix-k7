@@ -11,6 +11,7 @@ on:
       ids:       { description: "comma-separated task ids (e.g. t01,t02) or all(1..21)", default: "t01" }
       model:     { description: "deepseek or mimo", default: "deepseek" }
       runs:      { description: "max runs per task (early-abort on solve)", default: "3" }
+      lock:      { description: "lock egress to model API only (true) or skip for diagnosis (false)", default: "true" }
 permissions:
   contents: read
   actions: read            # to download artifacts from the build run
@@ -78,6 +79,7 @@ jobs:
           harbor run -p "$TASK" -a nop -o /tmp/pre --job-name pre -y -q > /tmp/pre.log 2>&1 || true
           echo "image(s): $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -i "$(basename "$TASK")" | tr '\n' ' ')"
       - name: Lock egress to model API only + SELF-CHECK (fails job if isolation wrong)
+        if: inputs.lock == 'true'
         run: |
           host=api.deepseek.com; [ "$MODEL" = mimo ] && host=api.xiaomimimo.com
           ips=$(getent ahostsv4 "$host" | awk '{print $1}' | sort -u)
