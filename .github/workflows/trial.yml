@@ -17,7 +17,7 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    outputs: { ids: ${{ steps.p.outputs.ids }} }
+    outputs: { ids: "${{ steps.p.outputs.ids }}" }
     steps:
       - id: p
         env: { IDS: "${{ inputs.ids }}" }
@@ -73,7 +73,7 @@ jobs:
           { echo "PV=$pv"; echo "SLUG=$slug"; echo "TASK=$pv/tasks/$slug"; } >> "$GITHUB_ENV"
           test -f "$pv/tasks/$slug/task.toml" && echo "task present" || { echo "no built task.toml"; exit 1; }
       - name: Pre-build task image (open net), via a nop grade
-        env: { ID: ${{ matrix.id }} }
+        env: { ID: "${{ matrix.id }}" }
         run: |
           harbor run -p "$TASK" -a nop -o /tmp/pre --job-name pre -y -q > /tmp/pre.log 2>&1 || true
           echo "image(s): $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -i "$(basename "$TASK")" | tr '\n' ' ')"
