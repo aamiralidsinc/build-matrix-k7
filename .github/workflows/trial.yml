@@ -95,11 +95,11 @@ jobs:
           sudo iptables -A trialguard -j REJECT --reject-with icmp-port-unreachable
           sudo iptables -I DOCKER-USER -j trialguard
           # self-check from a container on a docker bridge: github must be BLOCKED, model API reachable
-          gh_code=$(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com 2>/dev/null || echo FAIL)
-          api_code=$(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$host" 2>/dev/null || echo FAIL)
-          echo "self-check: github=$gh_code (want FAIL) ; $host=$api_code (want non-FAIL)"
-          case "$gh_code" in FAIL|000) : ;; *) echo "ISOLATION BROKEN: github reachable"; exit 1 ;; esac
-          case "$api_code" in FAIL|000) echo "ISOLATION BROKEN: model API not reachable"; exit 1 ;; esac
+          gh_code=$(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com 2>/dev/null || true); gh_code=${gh_code:-000}
+          api_code=$(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$host" 2>/dev/null || true); api_code=${api_code:-000}
+          echo "self-check: github=$gh_code (want 000=blocked) ; $host=$api_code (want non-000=reachable)"
+          case "$gh_code" in 000) : ;; *) echo "ISOLATION BROKEN: github reachable ($gh_code)"; exit 1 ;; esac
+          case "$api_code" in 000) echo "ISOLATION BROKEN: model API not reachable ($api_code)"; exit 1 ;; esac
       - name: Trials (early-abort on solve)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
