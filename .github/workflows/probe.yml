@@ -1,0 +1,51 @@
+name: probe
+# Network-isolation probe: does the netguard sidecar build + run on an Actions runner, and what does
+# it allow/block? Reuses root/harness/netguard from the encrypted payload (no payload change). Proves
+# portability of the VM's isolation to Actions before any trial runs here. Read-only w.r.t. results.
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decrypt payload (for root/harness/netguard)
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+        run: |
+          mkdir -p /tmp/pl
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" -d payload.tar.gz.gpg | tar -xz -C /tmp/pl
+          pv=$(cat /tmp/pl/pv_path); echo "::add-mask::$pv"
+          test -f /tmp/pl/root/harness/netguard/Dockerfile && echo "netguard source present"
+      - name: Baseline — default container egress (expect open internet on Actions)
+        run: |
+          echo "example.com  -> $(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://example.com || echo FAIL)"
+          echo "github.com   -> $(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com || echo FAIL)"
+          echo "deepseek api -> $(docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 https://api.deepseek.com || echo FAIL)"
+      - name: Build netguard
+        run: docker build -t cwe-netguard:1 /tmp/pl/root/harness/netguard
+      - name: Probe through netguard (block-repo mode, sample repo rails/rails)
+        run: |
+          net=probe-$$;
+          # sidecar with egress filtering; main joins its netns, exactly like a trial's compose
+          docker run -d --name ng --cap-add NET_ADMIN --cap-add NET_RAW \
+            -e NETGUARD_BLOCK_REPOS=rails/rails -e NETGUARD_BLOCK_NAMES=rails \
+            -v ngcerts:/netguard-certs cwe-netguard:1
+          for i in $(seq 1 60); do docker exec ng test -f /tmp/netguard.ready 2>/dev/null && break; sleep 1; done
+          docker exec ng test -f /tmp/netguard.ready && echo "netguard: ready" || { echo "netguard: NOT ready"; docker logs ng | tail -20; }
+          probe() { docker run --rm --network container:ng -v ngcerts:/netguard-certs:ro \
+            -e CURL_CA_BUNDLE=/netguard-certs/bundle.pem curlimages/curl:8.11.1 \
+            -s -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null || echo FAIL; }
+          echo "via netguard | example.com         -> $(probe https://example.com)   (expect reachable: 200/3xx)"
+          echo "via netguard | api.deepseek.com     -> $(probe https://api.deepseek.com) (expect reachable)"
+          echo "via netguard | github rails/rails   -> $(probe https://github.com/rails/rails) (expect 403 BLOCKED)"
+          echo "via netguard | github other/repo    -> $(probe https://github.com/torvalds/linux) (expect reachable)"
+          echo "--- netguard decision log ---"; docker logs ng 2>&1 | grep -a netguard | tail -20
+          docker rm -f ng >/dev/null 2>&1 || true
+      - name: Verdict
+        run: |
+          echo "READ: if 'via netguard' blocks rails/rails (403) but allows example/deepseek, the sidecar"
+          echo "works on Actions. For OFFLINE trials we then flip netguard to allowlist ONLY the model API."
